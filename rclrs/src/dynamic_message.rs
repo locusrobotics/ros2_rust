@@ -23,11 +23,15 @@ mod dynamic_publisher;
 mod dynamic_subscription;
 mod error;
 mod field_access;
+mod generic_client;
+mod generic_service;
 mod message_structure;
 pub use dynamic_publisher::*;
 pub use dynamic_subscription::*;
 pub use error::*;
 pub use field_access::*;
+pub use generic_client::*;
+pub use generic_service::*;
 pub use message_structure::*;
 
 /// A struct to cache loaded shared libraries for dynamic messages, indexing them by name.
@@ -93,11 +97,15 @@ pub struct MessageTypeName {
 #[derive(Clone)]
 pub struct DynamicMessageMetadata {
     message_type: MessageTypeName,
-    // The library needs to be kept loaded in order to keep the type_support_ptr valid.
+    // The library needs to be kept loaded in order to keep the message_members_ptr valid.
     // This is the introspection type support library, not the regular one.
     #[allow(dead_code)]
     introspection_type_support_library: Arc<libloading::Library>,
-    type_support_ptr: *const rosidl_message_type_support_t,
+    // Points at the `rosidl_message_members_t` describing this message. This is the canonical
+    // source used to instantiate messages; it is valid for both construction paths (message type
+    // support and service request/response members) and is kept alive by
+    // `introspection_type_support_library`.
+    message_members_ptr: *const rosidl_message_members_t,
     structure: MessageStructure,
     fini_function: unsafe extern "C" fn(*mut std::os::raw::c_void),
 }
@@ -187,6 +195,90 @@ unsafe fn get_type_support_handle(
 
 const INTROSPECTION_TYPE_SUPPORT_IDENTIFIER: &str = "rosidl_typesupport_introspection_c";
 
+/// The regular (non-introspection) C type support identifier, used to obtain the type support
+/// handle passed to `rcl_service_init` / `rcl_client_init`.
+pub(crate) const REGULAR_TYPE_SUPPORT_IDENTIFIER: &str = "rosidl_typesupport_c";
+
+/// A parsed/validated service type name of the form `<package_name>/srv/<type_name>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceTypeName {
+    /// The package name, which acts as a namespace.
+    pub package_name: String,
+    /// The name of the service type in the package.
+    pub type_name: String,
+}
+
+impl TryFrom<&str> for ServiceTypeName {
+    type Error = DynamicMessageError;
+    fn try_from(full_service_type: &str) -> Result<Self, Self::Error> {
+        let mut parts = full_service_type.split('/');
+        use DynamicMessageError::InvalidMessageTypeSyntax;
+        let package_name = parts
+            .next()
+            .ok_or(InvalidMessageTypeSyntax {
+                input: full_service_type.to_owned(),
+            })?
+            .to_owned();
+        if Some("srv") != parts.next() {
+            return Err(InvalidMessageTypeSyntax {
+                input: full_service_type.to_owned(),
+            });
+        };
+        let type_name = parts
+            .next()
+            .ok_or(InvalidMessageTypeSyntax {
+                input: full_service_type.to_owned(),
+            })?
+            .to_owned();
+        if parts.next().is_some() {
+            return Err(InvalidMessageTypeSyntax {
+                input: full_service_type.to_owned(),
+            });
+        }
+        Ok(Self {
+            package_name,
+            type_name,
+        })
+    }
+}
+
+impl Display for ServiceTypeName {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}/srv/{}", self.package_name, self.type_name)
+    }
+}
+
+/// Analogue of [`get_type_support_handle`] for services.
+///
+/// Loads the `<identifier>__get_service_type_support_handle__<pkg>__srv__<Type>` symbol from the
+/// given library and returns the resulting `rosidl_service_type_support_t` pointer.
+///
+/// # Safety
+///
+/// It would be theoretically possible to pass in a library that has the expected symbol defined,
+/// but with an unexpected type. The caller is responsible for keeping the library loaded while
+/// using the returned pointer.
+pub(crate) unsafe fn get_service_type_support_handle(
+    type_support_library: &libloading::Library,
+    type_support_identifier: &str,
+    service_type: &ServiceTypeName,
+) -> Result<*const rosidl_service_type_support_t, DynamicMessageError> {
+    let symbol_name = format!(
+        "{}__get_service_type_support_handle__{}__srv__{}",
+        type_support_identifier, service_type.package_name, service_type.type_name
+    );
+
+    // SAFETY: We know that the symbol has this type, from the safety requirement of this function.
+    let getter: libloading::Symbol<unsafe extern "C" fn() -> *const rosidl_service_type_support_t> = {
+        type_support_library
+            .get(symbol_name.as_bytes())
+            .map_err(|_| DynamicMessageError::InvalidMessageType)?
+    };
+
+    // SAFETY: The caller is responsible for keeping the library loaded while using this pointer.
+    Ok(getter())
+}
+
 // ========================= impl for MessageTypeName =========================
 
 impl TryFrom<&str> for MessageTypeName {
@@ -242,7 +334,7 @@ impl Deref for DynamicMessageMetadata {
 // they are running in. Therefore, this type can be safely sent to another thread.
 unsafe impl Send for DynamicMessageMetadata {}
 
-// SAFETY: The type_support_ptr member is the one that makes this type not implement Sync
+// SAFETY: The message_members_ptr member is the one that makes this type not implement Sync
 // automatically, but it is not used for interior mutability.
 unsafe impl Sync for DynamicMessageMetadata {}
 
@@ -278,11 +370,41 @@ impl DynamicMessageMetadata {
         let metadata = DynamicMessageMetadata {
             message_type,
             introspection_type_support_library: library,
-            type_support_ptr,
+            message_members_ptr: type_support.data as *const rosidl_message_members_t,
             structure,
             fini_function,
         };
         Ok(metadata)
+    }
+
+    /// Builds metadata directly from a `rosidl_message_members_t` pointer.
+    ///
+    /// This is used for service request/response messages, whose members are obtained from a
+    /// service type support (`rosidl_service_type_support_t`) rather than from a message type
+    /// support. The `library` must be the introspection type support library that owns `members`;
+    /// it is retained to keep `members` valid for the lifetime of the metadata.
+    ///
+    /// # Safety
+    ///
+    /// `members` must be a valid, non-null pointer to a `rosidl_message_members_t` obtained from
+    /// `library`, and must remain valid as long as `library` is loaded.
+    pub(crate) unsafe fn from_message_members(
+        library: Arc<libloading::Library>,
+        members: *const rosidl_message_members_t,
+        message_type: MessageTypeName,
+    ) -> Self {
+        // SAFETY: The caller guarantees `members` is valid.
+        let message_members: &rosidl_message_members_t = &*members;
+        // SAFETY: The message members coming from a type support library will always be valid.
+        let structure = MessageStructure::from_rosidl_message_members(message_members);
+        let fini_function = message_members.fini_function.unwrap();
+        DynamicMessageMetadata {
+            message_type,
+            introspection_type_support_library: library,
+            message_members_ptr: members,
+            structure,
+            fini_function,
+        }
     }
 
     /// Instantiates a new message.
@@ -300,11 +422,8 @@ impl DynamicMessageMetadata {
             // The mutable reference decays into a (fat) *mut [u8]
             Box::from_raw(slice)
         };
-        // SAFETY: The pointer returned by get_type_support_handle() is always valid.
-        let type_support = unsafe { &*self.type_support_ptr };
-        let message_members: &rosidl_message_members_t =
-            // SAFETY: The data pointer is supposed to be always valid.
-            unsafe { &*(type_support.data as *const rosidl_message_members_t) };
+        // SAFETY: The members pointer is kept valid by the retained type support library.
+        let message_members: &rosidl_message_members_t = unsafe { &*self.message_members_ptr };
         // SAFETY: The init function is passed zeroed memory of the correct alignment.
         unsafe {
             (message_members.init_function.unwrap())(
@@ -346,7 +465,7 @@ impl Drop for DynamicMessage {
 
 impl PartialEq for DynamicMessage {
     fn eq(&self, other: &Self) -> bool {
-        self.metadata.type_support_ptr == other.metadata.type_support_ptr
+        self.metadata.message_members_ptr == other.metadata.message_members_ptr
             && self.storage == other.storage
     }
 }

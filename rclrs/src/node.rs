@@ -33,8 +33,9 @@ use rosidl_runtime_rs::{Action, Message};
 use crate::{
     dynamic_message::{
         DynamicMessage, DynamicPublisher, DynamicPublisherState, DynamicSubscription,
-        DynamicSubscriptionState, MessageTypeName, NodeAsyncDynamicSubscriptionCallback,
-        NodeDynamicSubscriptionCallback,
+        DynamicSubscriptionState, GenericClient, GenericClientState, GenericService,
+        GenericServiceCallback, GenericServiceState, MessageTypeName,
+        NodeAsyncDynamicSubscriptionCallback, NodeDynamicSubscriptionCallback, ServiceTypeName,
     },
     rcl_bindings::*,
     ActionClient, ActionClientState, ActionGoalReceiver, ActionServer, ActionServerState,
@@ -939,6 +940,42 @@ impl NodeState {
             topic_type,
             options,
             NodeDynamicSubscriptionCallback::new(callback),
+            &self.handle,
+            self.commands.async_worker_commands(),
+        )
+    }
+
+    /// Creates a [`GenericService`] whose request/response types are only known at runtime.
+    ///
+    /// The `service_type` is of the form `<package>/srv/<Type>`, e.g. `std_srvs/srv/SetBool`.
+    /// The callback receives the request [`crate::DynamicMessage`] and a freshly-created empty
+    /// response [`crate::DynamicMessage`], and must return the populated response.
+    pub fn create_generic_service<'a>(
+        &self,
+        service_type: ServiceTypeName,
+        options: impl Into<ServiceOptions<'a>>,
+        callback: GenericServiceCallback,
+    ) -> Result<GenericService, RclrsError> {
+        GenericServiceState::create(
+            service_type,
+            options,
+            callback,
+            &self.handle,
+            self.commands.async_worker_commands(),
+        )
+    }
+
+    /// Creates a [`GenericClient`] whose request/response types are only known at runtime.
+    ///
+    /// The `service_type` is of the form `<package>/srv/<Type>`, e.g. `std_srvs/srv/SetBool`.
+    pub fn create_generic_client<'a>(
+        &self,
+        service_type: ServiceTypeName,
+        options: impl Into<ClientOptions<'a>>,
+    ) -> Result<GenericClient, RclrsError> {
+        GenericClientState::create(
+            service_type,
+            options,
             &self.handle,
             self.commands.async_worker_commands(),
         )

@@ -1,0 +1,20 @@
+[package]
+name = "ros-env"
+version = "0.2.0"
+edition = "2021"
+description = "Vendored ROS 2 interface bindings for rclrs (committed generated sources)."
+license = "Apache-2.0"
+
+[lib]
+name = "ros_env"
+path = "src/lib.rs"
+
+[dependencies]
+rosidl_runtime_rs = { path = "../rosidl_runtime_rs" }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde-big-array = { version = "0.5.1", optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "dep:serde-big-array", "rosidl_runtime_rs/serde"]
+use_ros_shim = ["rosidl_runtime_rs/use_ros_shim"]

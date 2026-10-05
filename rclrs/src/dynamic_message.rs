@@ -199,6 +199,35 @@ const INTROSPECTION_TYPE_SUPPORT_IDENTIFIER: &str = "rosidl_typesupport_introspe
 /// handle passed to `rcl_service_init` / `rcl_client_init`.
 pub(crate) const REGULAR_TYPE_SUPPORT_IDENTIFIER: &str = "rosidl_typesupport_c";
 
+/// Loads the regular (`rosidl_typesupport_c`) message type support handle for a message type,
+/// supporting both plain topic messages (`__msg__` infix) and service request/response messages
+/// (`__srv__` infix).
+///
+/// # Safety
+///
+/// The returned pointer is only valid while `type_support_library` stays loaded.
+unsafe fn get_regular_message_type_support_handle(
+    type_support_library: &libloading::Library,
+    message_type: &MessageTypeName,
+) -> Result<*const rosidl_message_type_support_t, DynamicMessageError> {
+    for infix in ["msg", "srv"] {
+        let symbol_name = format!(
+            "{}__get_message_type_support_handle__{}__{}__{}",
+            REGULAR_TYPE_SUPPORT_IDENTIFIER,
+            &message_type.package_name,
+            infix,
+            &message_type.type_name
+        );
+        if let Ok(getter) = type_support_library
+            .get::<unsafe extern "C" fn() -> *const rosidl_message_type_support_t>(
+            symbol_name.as_bytes(),
+        ) {
+            return Ok(getter());
+        }
+    }
+    Err(DynamicMessageError::InvalidMessageType)
+}
+
 /// A parsed/validated service type name of the form `<package_name>/srv/<type_name>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceTypeName {
@@ -443,6 +472,137 @@ impl DynamicMessageMetadata {
     pub fn structure(&self) -> &MessageStructure {
         &self.structure
     }
+
+    /// Loads the regular (`rosidl_typesupport_c`) message type support handle for this
+    /// message type, used by [`rmw_serialize`]/[`rmw_deserialize`].
+    ///
+    /// The returned pointer is kept valid by the returned library, which the caller must
+    /// keep alive for as long as the pointer is used.
+    fn regular_message_type_support(
+        &self,
+    ) -> Result<
+        (
+            Arc<libloading::Library>,
+            *const rosidl_message_type_support_t,
+        ),
+        DynamicMessageError,
+    > {
+        let library = get_type_support_library(
+            &self.message_type.package_name,
+            REGULAR_TYPE_SUPPORT_IDENTIFIER,
+        )?;
+        // Plain messages expose their regular type support under the `__msg__` infix, while
+        // service request/response messages use the `__srv__` infix. Try both so this works for
+        // both topic messages and service request/response messages.
+        // SAFETY: The symbol type of the type support getter is trusted assuming the install
+        // dir hasn't been tampered with. The returned pointer stays valid while `library` lives.
+        let type_support_ptr =
+            unsafe { get_regular_message_type_support_handle(&library, &self.message_type)? };
+        Ok((library, type_support_ptr))
+    }
+
+    /// Serializes a dynamic message of this type into its raw CDR byte representation.
+    ///
+    /// The `message` must have been created from compatible metadata (same message type).
+    pub fn serialize(&self, message: &DynamicMessage) -> Result<Vec<u8>, DynamicMessageError> {
+        let (_library, type_support) = self.regular_message_type_support()?;
+
+        // SAFETY: A zeroed rcl_serialized_message_t is a valid empty buffer.
+        let mut serialized_message: rcl_serialized_message_t = unsafe { std::mem::zeroed() };
+        // SAFETY: No preconditions for getting the default allocator.
+        let allocator = unsafe { rcutils_get_default_allocator() };
+        // SAFETY: serialized_message is valid; initial capacity 0 lets rmw grow it as needed.
+        unsafe { rcutils_uint8_array_init(&mut serialized_message, 0, &allocator) }
+            .to_dynamic_message_result()?;
+
+        // SAFETY: message.storage holds an initialized message of the type `type_support`
+        // describes; serialized_message is initialized above.
+        let serialize_result = unsafe {
+            rmw_serialize(
+                message.storage.as_ptr() as *const _,
+                type_support,
+                &mut serialized_message,
+            )
+        }
+        .to_dynamic_message_result();
+
+        let bytes_result = serialize_result.map(|()| {
+            if serialized_message.buffer.is_null() || serialized_message.buffer_length == 0 {
+                Vec::new()
+            } else {
+                // SAFETY: buffer points to buffer_length valid bytes.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        serialized_message.buffer,
+                        serialized_message.buffer_length,
+                    )
+                }
+                .to_vec()
+            }
+        });
+
+        // SAFETY: serialized_message was initialized; always clean it up.
+        unsafe { rcutils_uint8_array_fini(&mut serialized_message) };
+
+        bytes_result
+    }
+
+    /// Deserializes raw CDR bytes into a new dynamic message of this type.
+    pub fn deserialize(&self, bytes: &[u8]) -> Result<DynamicMessage, DynamicMessageError> {
+        let (_library, type_support) = self.regular_message_type_support()?;
+
+        let mut message = self.create()?;
+
+        // SAFETY: A zeroed rcl_serialized_message_t is a valid empty buffer.
+        let mut serialized_message: rcl_serialized_message_t = unsafe { std::mem::zeroed() };
+        // SAFETY: No preconditions for getting the default allocator.
+        let allocator = unsafe { rcutils_get_default_allocator() };
+        // SAFETY: serialized_message is valid; allocate capacity for the incoming bytes.
+        unsafe { rcutils_uint8_array_init(&mut serialized_message, bytes.len(), &allocator) }
+            .to_dynamic_message_result()?;
+        if !bytes.is_empty() {
+            // SAFETY: Both buffers are valid for bytes.len() and the dest was allocated above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    serialized_message.buffer,
+                    bytes.len(),
+                );
+            }
+            serialized_message.buffer_length = bytes.len();
+        }
+
+        // SAFETY: serialized_message holds the input bytes; message.storage is an initialized
+        // message of the type `type_support` describes.
+        let deserialize_result = unsafe {
+            rmw_deserialize(
+                &serialized_message,
+                type_support,
+                message.storage.as_mut_ptr() as *mut _,
+            )
+        }
+        .to_dynamic_message_result();
+
+        // SAFETY: serialized_message was initialized; always clean it up.
+        unsafe { rcutils_uint8_array_fini(&mut serialized_message) };
+
+        deserialize_result.map(|()| message)
+    }
+}
+
+/// Converts an `rmw_ret_t`/`rcutils_ret_t` into a [`DynamicMessageError`] on failure.
+trait ToDynamicMessageResult {
+    fn to_dynamic_message_result(self) -> Result<(), DynamicMessageError>;
+}
+
+impl ToDynamicMessageResult for rmw_ret_t {
+    fn to_dynamic_message_result(self) -> Result<(), DynamicMessageError> {
+        if self == 0 {
+            Ok(())
+        } else {
+            Err(DynamicMessageError::RmwSerializationError { code: self })
+        }
+    }
 }
 
 // ========================= impl for DynamicMessage =========================
@@ -485,6 +645,16 @@ impl DynamicMessage {
     /// [`crate::dynamic_message::DynamicMessageMetadata::create`]
     pub fn new(message_type: MessageTypeName) -> Result<Self, DynamicMessageError> {
         DynamicMessageMetadata::new(message_type)?.create()
+    }
+
+    /// Returns the metadata describing this message's type.
+    pub fn metadata(&self) -> &DynamicMessageMetadata {
+        &self.metadata
+    }
+
+    /// Serializes this message into its raw CDR byte representation.
+    pub fn serialize(&self) -> Result<Vec<u8>, DynamicMessageError> {
+        self.metadata.serialize(self)
     }
 
     /// See [`DynamicMessageView::get()`][1].

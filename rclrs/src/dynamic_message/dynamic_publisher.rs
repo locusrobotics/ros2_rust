@@ -155,8 +155,7 @@ impl DynamicPublisherState {
     /// [1]: https://github.com/ros2/ros2/issues/255
     pub fn publish_serialized(&self, bytes: &[u8]) -> Result<(), RclrsError> {
         // SAFETY: Getting a zero-initialized value is always safe.
-        let mut serialized_message: rcl_serialized_message_t =
-            unsafe { std::mem::zeroed() };
+        let mut serialized_message: rcl_serialized_message_t = unsafe { std::mem::zeroed() };
         // SAFETY: No preconditions; returns the process-default allocator.
         let allocator = unsafe { rcutils_get_default_allocator() };
 

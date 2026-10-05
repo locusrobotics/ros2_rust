@@ -20,6 +20,11 @@ pub enum DynamicMessageError {
     MessageTypeMismatch,
     /// Loading the type support library failed.
     LibraryLoadingError(libloading::Error),
+    /// Serializing or deserializing a message via rmw failed.
+    RmwSerializationError {
+        /// The non-OK `rmw_ret_t` returned by rmw.
+        code: i32,
+    },
 }
 
 impl fmt::Display for DynamicMessageError {
@@ -39,6 +44,9 @@ impl fmt::Display for DynamicMessageError {
                 "The operation expected a dynamic message of a different type"
             ),
             Self::LibraryLoadingError(_) => write!(f, "Loading the type support library failed"),
+            Self::RmwSerializationError { code } => {
+                write!(f, "rmw serialization failed with code {}", code)
+            }
         }
     }
 }

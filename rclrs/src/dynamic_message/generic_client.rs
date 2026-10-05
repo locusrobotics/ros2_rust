@@ -108,9 +108,37 @@ impl GenericClientState {
         })
     }
 
+    /// Sends a serialized request and blocks until the serialized response arrives or the
+    /// timeout elapses.
+    ///
+    /// The `request_bytes` must be the CDR serialization of this service's request message. The
+    /// returned bytes are the CDR serialization of the response message. Like [`call`], this must
+    /// NOT be called from the executor spin thread.
+    ///
+    /// [`call`]: Self::call
+    pub fn call_serialized(
+        &self,
+        request_bytes: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, RclrsError> {
+        let request = self.request_metadata.deserialize(request_bytes)?;
+        let response = self.call(request, timeout)?;
+        Ok(self.response_metadata.serialize(&response)?)
+    }
+
     /// Builds a request message for this client's service type.
     pub fn create_request(&self) -> Result<DynamicMessage, RclrsError> {
         Ok(self.request_metadata.create()?)
+    }
+
+    /// Returns the metadata describing this client's request message type.
+    pub fn request_metadata(&self) -> &DynamicMessageMetadata {
+        &self.request_metadata
+    }
+
+    /// Returns the metadata describing this client's response message type.
+    pub fn response_metadata(&self) -> &DynamicMessageMetadata {
+        &self.response_metadata
     }
 
     /// Creates a new generic client.

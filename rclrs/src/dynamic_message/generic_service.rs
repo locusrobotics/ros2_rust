@@ -269,3 +269,102 @@ impl Drop for GenericServiceHandle {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn set_int64(message: &mut DynamicMessage, field: &str, value: i64) {
+        let crate::dynamic_message::ValueMut::Simple(
+            crate::dynamic_message::SimpleValueMut::Int64(v),
+        ) = message.get_mut(field).unwrap()
+        else {
+            panic!("field {} was not an int64", field);
+        };
+        *v = value;
+    }
+
+    fn get_int64(message: &DynamicMessage, field: &str) -> i64 {
+        let crate::dynamic_message::Value::Simple(crate::dynamic_message::SimpleValue::Int64(v)) =
+            message.get(field).unwrap()
+        else {
+            panic!("field {} was not an int64", field);
+        };
+        *v
+    }
+
+    #[test]
+    fn test_serialized_service_round_trip() -> Result<(), RclrsError> {
+        let mut executor = Context::default().create_basic_executor();
+        let node = executor
+            .create_node(format!("test_serialized_service_{}", line!()).as_str())
+            .unwrap();
+
+        let client = node.create_generic_client(
+            "example_interfaces/srv/AddTwoInts".try_into()?,
+            "serialized_add_two_ints",
+        )?;
+
+        // Capture the correct request/response metadata (derived from the service type support)
+        // so the serialized callback can decode the request and encode the response. These are
+        // the same types the service itself uses.
+        let request_metadata = client.request_metadata().clone();
+        let response_metadata = client.response_metadata().clone();
+
+        // Serialized service: deserialize the request, add the operands, return a serialized
+        // response.
+        let _service = node.create_generic_serialized_service(
+            "example_interfaces/srv/AddTwoInts".try_into()?,
+            "serialized_add_two_ints",
+            move |request_bytes: Vec<u8>| {
+                let request = request_metadata.deserialize(&request_bytes).unwrap();
+                let a = get_int64(&request, "a");
+                let b = get_int64(&request, "b");
+                let mut response = response_metadata.create().unwrap();
+                set_int64(&mut response, "sum", a + b);
+                response.serialize().unwrap()
+            },
+        )?;
+
+        // Wait for the service to be discovered.
+        let start = std::time::Instant::now();
+        while !client.service_is_ready()? {
+            executor.spin(SpinOptions::spin_once());
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        }
+
+        // Build a serialized request using the client's request metadata.
+        let mut request = client.request_metadata().create()?;
+        set_int64(&mut request, "a", 40);
+        set_int64(&mut request, "b", 2);
+        let request_bytes = request.serialize()?;
+
+        // The blocking call must run off the executor spin thread.
+        let result: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let done = Arc::new(AtomicBool::new(false));
+        let result_thread = Arc::clone(&result);
+        let done_thread = Arc::clone(&done);
+        let client_thread = Arc::clone(&client);
+        let handle = std::thread::spawn(move || {
+            let response = client_thread
+                .call_serialized(&request_bytes, std::time::Duration::from_secs(10))
+                .unwrap();
+            *result_thread.lock().unwrap() = Some(response);
+            done_thread.store(true, Ordering::Release);
+        });
+
+        let start = std::time::Instant::now();
+        while !done.load(Ordering::Acquire) {
+            executor.spin(SpinOptions::spin_once());
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        }
+        handle.join().unwrap();
+
+        let response_bytes = result.lock().unwrap().take().unwrap();
+        let response = client.response_metadata().deserialize(&response_bytes)?;
+        assert_eq!(get_int64(&response, "sum"), 42);
+        Ok(())
+    }
+}

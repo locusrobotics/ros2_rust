@@ -1006,6 +1006,45 @@ impl NodeState {
         )
     }
 
+    /// Creates a [`GenericService`] that operates on raw serialized (CDR) request/response bytes.
+    ///
+    /// The callback receives the serialized request bytes and must return the serialized
+    /// response bytes. This is useful for lossless, opaque relaying of service calls whose
+    /// contents never need to be inspected, and works for arbitrary service types.
+    pub fn create_generic_serialized_service<'a, F>(
+        &self,
+        service_type: ServiceTypeName,
+        options: impl Into<ServiceOptions<'a>>,
+        mut callback: F,
+    ) -> Result<GenericService, RclrsError>
+    where
+        F: FnMut(Vec<u8>) -> Vec<u8> + Send + 'static,
+    {
+        let wrapper: GenericServiceCallback = Box::new(
+            move |request: DynamicMessage, response_proto: DynamicMessage| {
+                // Serialize the incoming request, hand the raw bytes to the user callback, then
+                // deserialize the returned bytes into a response message. On any serialization
+                // failure, fall back to returning the empty (default) response prototype.
+                let request_bytes = match request.serialize() {
+                    Ok(bytes) => bytes,
+                    Err(_) => return response_proto,
+                };
+                let response_bytes = callback(request_bytes);
+                match response_proto.metadata().deserialize(&response_bytes) {
+                    Ok(response) => response,
+                    Err(_) => response_proto,
+                }
+            },
+        );
+        GenericServiceState::create(
+            service_type,
+            options,
+            wrapper,
+            &self.handle,
+            self.commands.async_worker_commands(),
+        )
+    }
+
     /// Creates a [`DynamicSubscription`] with an async callback.
     ///
     /// For the behavior and API refer to [`Node::create_async_subscription`][1], except two key

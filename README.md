@@ -51,13 +51,6 @@ sudo apt install -y git libclang-dev python3-pip python3-vcstool
 pip install --break-system-packages colcon-cargo colcon-ros-cargo
 ```
 
-Because of an issue in `rclrs` (https://github.com/ros2-rust/ros2_rust/issues/557), as a workaround, the following two packages need to be installed:
-
-```shell
-# Install workaround packages
-sudo apt install -y ros-$ROS_DISTRO-example-interfaces
-sudo apt install -y ros-$ROS_DISTRO-test-msgs
-```
 
 ### All ROS Distributions
 
@@ -65,111 +58,21 @@ sudo apt install -y ros-$ROS_DISTRO-test-msgs
 
 ```toml
 [dependencies]
-rclrs = "0.7"
+rclrs = "0.8"
 ```
 
-Due to different ROS 2 distributions having different levels of integration with `rclrs`, if you'd like to
-build and run the examples, please follow the corresponding section.
-
-### ROS 2 Lyrical Luth and Rolling
-
-To run the examples, install the `test_msgs` and `example_interfaces` packages, clone the examples repository to your workspace, and build:
+To build and run the examples, install the `example_interfaces` and `test_msgs` ROS packages, then clone the examples repository into a workspace:
 
 ```shell
-sudo apt install -y ros-rolling-example-interfaces ros-rolling-test-msgs
+sudo apt install -y ros-$ROS_DISTRO-example-interfaces ros-$ROS_DISTRO-test-msgs
 mkdir -p workspace/src && cd workspace
 git clone https://github.com/ros2-rust/examples.git src/examples
 ```
 
-Temporarily (as of 2025-01-21), the `rosidl_rust` repository which contains the code generator needs to be cloned as well:
-
-```shell
-mkdir -p workspace/src && cd workspace
-git clone https://github.com/ros2-rust/rosidl_rust.git src/rosidl_rust
-```
-
-The above commands can be removed once an updated version of the generator is shipped with the next ROS 2 sync.
-
 Build the workspace:
 
 ```shell
-. /opt/ros/rolling/setup.sh  # Or source your ROS 2 installation
-colcon build
-```
-
-### ROS 2 Kilted Kaiju
-
-For ROS 2 Kilted, clone the ROS 2 message packages to your workspace:
-
-```shell
-mkdir -p workspace/src && cd workspace
-git clone -b kilted https://github.com/ros2/common_interfaces.git src/common_interfaces
-git clone -b kilted https://github.com/ros2/example_interfaces.git src/example_interfaces
-git clone -b kilted https://github.com/ros2/rcl_interfaces.git src/rcl_interfaces
-git clone -b kilted https://github.com/ros2/rosidl_core.git src/rosidl_core
-git clone -b kilted https://github.com/ros2/rosidl_defaults.git src/rosidl_defaults
-git clone -b kilted https://github.com/ros2/unique_identifier_msgs.git src/unique_identifier_msgs
-```
-
-Temporarily (as of 2025-01-21), the `rosidl_rust` repository which contains the code generator needs to be cloned as well:
-
-```shell
-git clone https://github.com/ros2-rust/rosidl_rust.git src/rosidl_rust
-```
-
-The above command can be removed once an updated version of the generator is shipped with the next ROS 2 sync.
-
-Build the workspace:
-
-```shell
-. /opt/ros/kilted/setup.sh
-colcon build
-```
-
-### ROS 2 Jazzy Jalisco
-
-For ROS 2 Jazzy, you need to clone the code generator and message packages to your workspace:
-
-```shell
-mkdir -p workspace/src && cd workspace
-git clone -b jazzy https://github.com/ros2/common_interfaces.git src/common_interfaces
-git clone -b jazzy https://github.com/ros2/example_interfaces.git src/example_interfaces
-git clone -b jazzy https://github.com/ros2/rcl_interfaces.git src/rcl_interfaces
-git clone -b jazzy https://github.com/ros2/rosidl_core.git src/rosidl_core
-git clone -b jazzy https://github.com/ros2/rosidl_defaults.git src/rosidl_defaults
-git clone -b jazzy https://github.com/ros2/unique_identifier_msgs.git src/unique_identifier_msgs
-git clone https://github.com/ros2-rust/rosidl_rust.git src/rosidl_rust
-git clone https://github.com/ros2-rust/examples.git src/examples
-```
-
-Build the workspace:
-
-```shell
-. /opt/ros/jazzy/setup.sh
-colcon build
-```
-
-
-### ROS 2 Humble Hawksbill
-
-For ROS 2 Humble, you need to clone the code generator and message packages to your workspace:
-
-```shell
-mkdir -p workspace/src && cd workspace
-git clone -b humble https://github.com/ros2/common_interfaces.git src/common_interfaces
-git clone -b humble https://github.com/ros2/example_interfaces.git src/example_interfaces
-git clone -b humble https://github.com/ros2/rcl_interfaces.git src/rcl_interfaces
-git clone -b humble https://github.com/ros2/rosidl_core.git src/rosidl_core
-git clone -b humble https://github.com/ros2/rosidl_defaults.git src/rosidl_defaults
-git clone -b humble https://github.com/ros2/unique_identifier_msgs.git src/unique_identifier_msgs
-git clone https://github.com/ros2-rust/rosidl_rust.git src/rosidl_rust
-git clone https://github.com/ros2-rust/examples.git src/examples
-```
-
-Build the workspace:
-
-```shell
-. /opt/ros/humble/setup.sh
+. /opt/ros/$ROS_DISTRO/setup.sh  # Or source your ROS 2 installation
 colcon build
 ```
 
@@ -195,6 +98,21 @@ ros2 launch examples_rclrs_minimal_pub_sub minimal_pub_sub.launch.xml
 ```
 
 For detailed building instructions and additional setup options, see the [in-depth guide](docs/building.md).
+
+## AI Policy
+Generative tools are allowed in producing contributions to its projects, with some qualifications:
+
+- Any contribution may consist, in whole or in part, of the output of one or more generative tools.
+- Any use of generative tools in a contribution must be disclosed at the time of making the contribution.
+- The disclosure must be recorded in a way that ensures it has the same or greater lifetime as the contribution itself.
+
+For source code contributions, you should add a disclosure statement in the commit message for all commits where some portion of the source code was generated.
+
+`Assisted-by: AGENT_NAME:MODEL_VERSION [TOOL1] [TOOL2]`
+
+Provide a similar disclosure statement in the PR description.
+
+See the projects [AI Policy](docs/AI_POLICY.md) for more details.
 
 ## Further Documentation
 

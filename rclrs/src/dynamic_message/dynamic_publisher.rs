@@ -136,6 +136,88 @@ impl DynamicPublisherState {
             .ok()
         }
     }
+
+    /// Publishes a pre-serialized message (raw CDR bytes).
+    ///
+    /// Unlike [`publish`][Self::publish], this does not require constructing a
+    /// [`DynamicMessage`]; the provided bytes are forwarded to the middleware
+    /// verbatim as a serialized message. This is useful for opaque relaying of
+    /// messages whose contents never need to be inspected, and it is lossless
+    /// for arbitrary message types (arrays, nested messages, etc.).
+    ///
+    /// The caller is responsible for ensuring that `bytes` is a valid CDR
+    /// serialization of this publisher's message type. The middleware does not
+    /// validate the payload.
+    ///
+    /// Calling `publish_serialized()` is a potentially blocking call, see
+    /// [this issue][1] for details.
+    ///
+    /// [1]: https://github.com/ros2/ros2/issues/255
+    pub fn publish_serialized(&self, bytes: &[u8]) -> Result<(), RclrsError> {
+        // SAFETY: Getting a zero-initialized value is always safe.
+        let mut serialized_message: rcl_serialized_message_t =
+            unsafe { std::mem::zeroed() };
+        // SAFETY: No preconditions; returns the process-default allocator.
+        let allocator = unsafe { rcutils_get_default_allocator() };
+
+        // Initialize a resizable byte buffer with capacity for our payload.
+        // SAFETY: `serialized_message` is a fresh zeroed value as required by
+        // init; `allocator` is valid for the duration of the call.
+        unsafe {
+            rcutils_uint8_array_init(&mut serialized_message, bytes.len(), &allocator)
+                .to_rcl_result()?;
+        }
+
+        // Copy the payload into the buffer and record its length.
+        // SAFETY: `init` allocated at least `bytes.len()` bytes of capacity, so
+        // the destination region is valid for `bytes.len()` writes.
+        unsafe {
+            if !bytes.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    serialized_message.buffer,
+                    bytes.len(),
+                );
+            }
+            serialized_message.buffer_length = bytes.len();
+        }
+
+        let publish_result = {
+            let rcl_publisher = &mut *self.handle.rcl_publisher.lock().unwrap();
+            // SAFETY: The publisher handle is valid. The serialized message is
+            // initialized and valid for the duration of the call. The third
+            // argument is explicitly allowed to be NULL.
+            unsafe {
+                rcl_publish_serialized_message(
+                    rcl_publisher,
+                    &serialized_message,
+                    std::ptr::null_mut(),
+                )
+                .ok()
+            }
+        };
+
+        // Always release the buffer, regardless of publish success.
+        // SAFETY: `serialized_message` was successfully initialized above.
+        unsafe {
+            let _ = rcutils_uint8_array_fini(&mut serialized_message);
+        }
+
+        publish_result
+    }
+}
+
+/// Converts a `rcutils_ret_t` into a `Result` using the same error machinery
+/// as `rcl_ret_t` (the two share the same underlying value space, but are
+/// distinct integer typedefs).
+trait RcutilsRetToResult {
+    fn to_rcl_result(self) -> Result<(), RclrsError>;
+}
+
+impl RcutilsRetToResult for rcutils_ret_t {
+    fn to_rcl_result(self) -> Result<(), RclrsError> {
+        (self as rcl_ret_t).ok()
+    }
 }
 
 #[cfg(test)]

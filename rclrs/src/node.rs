@@ -35,7 +35,8 @@ use crate::{
         DynamicMessage, DynamicPublisher, DynamicPublisherState, DynamicSubscription,
         DynamicSubscriptionState, GenericClient, GenericClientState, GenericService,
         GenericServiceCallback, GenericServiceState, MessageTypeName,
-        NodeAsyncDynamicSubscriptionCallback, NodeDynamicSubscriptionCallback, ServiceTypeName,
+        NodeAsyncDynamicSubscriptionCallback, NodeDynamicSubscriptionCallback,
+        NodeSerializedSubscriptionCallback, ServiceTypeName,
     },
     rcl_bindings::*,
     ActionClient, ActionClientState, ActionGoalReceiver, ActionServer, ActionServerState,
@@ -940,6 +941,30 @@ impl NodeState {
             topic_type,
             options,
             NodeDynamicSubscriptionCallback::new(callback),
+            &self.handle,
+            self.commands.async_worker_commands(),
+        )
+    }
+
+    /// Creates a dynamic subscription that delivers the raw serialized (CDR)
+    /// message bytes to the callback, instead of a decoded [`DynamicMessage`].
+    ///
+    /// This is useful for lossless, opaque relaying of messages whose contents
+    /// never need to be inspected: the serialized payload is forwarded verbatim
+    /// and works for arbitrary message types (arrays, nested messages, etc.).
+    pub fn create_dynamic_serialized_subscription<'a, F>(
+        &self,
+        topic_type: MessageTypeName,
+        options: impl Into<SubscriptionOptions<'a>>,
+        callback: F,
+    ) -> Result<DynamicSubscription, RclrsError>
+    where
+        F: Fn(Vec<u8>, MessageInfo) + Send + Sync + 'static,
+    {
+        DynamicSubscriptionState::<Node>::create(
+            topic_type,
+            options,
+            NodeSerializedSubscriptionCallback::new(callback),
             &self.handle,
             self.commands.async_worker_commands(),
         )

@@ -126,11 +126,39 @@ impl<Payload> DerefMut for WorkerDynamicSubscriptionCallback<Payload> {
     }
 }
 
+/// A callback that receives the raw serialized (CDR) message bytes instead of a
+/// decoded [`DynamicMessage`]. Used for lossless opaque relaying.
+pub(crate) struct NodeSerializedSubscriptionCallback(
+    Box<dyn Fn(Vec<u8>, MessageInfo) + Send + Sync>,
+);
+
+impl NodeSerializedSubscriptionCallback {
+    pub(crate) fn new(f: impl Fn(Vec<u8>, MessageInfo) + Send + Sync + 'static) -> Self {
+        NodeSerializedSubscriptionCallback(Box::new(f))
+    }
+}
+
+impl Deref for NodeSerializedSubscriptionCallback {
+    type Target = Box<dyn Fn(Vec<u8>, MessageInfo) + 'static + Send + Sync>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 pub(crate) enum DynamicSubscriptionCallback<Payload> {
     /// A callback with the message and the message info as arguments.
     Node(NodeAsyncDynamicSubscriptionCallback),
     /// A callback with the payload, message, and the message info as arguments.
     Worker(WorkerDynamicSubscriptionCallback<Payload>),
+    /// A callback with the raw serialized message bytes and the message info as
+    /// arguments. The payload type parameter is unused for this variant.
+    SerializedNode(NodeSerializedSubscriptionCallback),
+}
+
+impl From<NodeSerializedSubscriptionCallback> for DynamicSubscriptionCallback<()> {
+    fn from(value: NodeSerializedSubscriptionCallback) -> Self {
+        DynamicSubscriptionCallback::SerializedNode(value)
+    }
 }
 
 impl From<NodeDynamicSubscriptionCallback> for DynamicSubscriptionCallback<()> {
@@ -184,6 +212,10 @@ impl<Payload: 'static> DynamicSubscriptionCallback<Payload> {
                     let (msg, msg_info) = executable.take()?;
                     cb(payload, msg, msg_info);
                 }
+                Self::SerializedNode(cb) => {
+                    let (bytes, msg_info) = executable.take_serialized()?;
+                    cb(bytes, msg_info);
+                }
             }
             Ok(())
         };
@@ -213,6 +245,66 @@ impl<Payload> DynamicSubscriptionExecutable<Payload> {
             dynamic_message,
             MessageInfo::from_rmw_message_info(&message_info),
         ))
+    }
+
+    /// Takes the next message as raw serialized (CDR) bytes, without decoding
+    /// it into a [`DynamicMessage`]. Lossless for arbitrary message types.
+    fn take_serialized(&self) -> Result<(Vec<u8>, MessageInfo), RclrsError> {
+        // SAFETY: Getting a zero-initialized value is always safe.
+        let mut serialized_message: rcl_serialized_message_t = unsafe { std::mem::zeroed() };
+        // SAFETY: No preconditions; returns the process-default allocator.
+        let allocator = unsafe { rcutils_get_default_allocator() };
+        // Initialize with zero capacity; rcl_take_serialized_message will grow
+        // the buffer as needed via the allocator.
+        // SAFETY: `serialized_message` is freshly zeroed; `allocator` is valid.
+        unsafe {
+            (rcutils_uint8_array_init(&mut serialized_message, 0, &allocator) as rcl_ret_t).ok()?;
+        }
+
+        let mut message_info = unsafe { rmw_get_zero_initialized_message_info() };
+        let take_result = {
+            let rcl_subscription = &mut *self.handle.lock();
+            // SAFETY: The subscription handle is valid. The serialized message
+            // is initialized. The last argument is explicitly allowed to be NULL.
+            unsafe {
+                rcl_take_serialized_message(
+                    rcl_subscription,
+                    &mut serialized_message,
+                    &mut message_info,
+                    std::ptr::null_mut(),
+                )
+                .ok()
+            }
+        };
+
+        if let Err(e) = take_result {
+            // SAFETY: `serialized_message` was successfully initialized above.
+            unsafe {
+                let _ = rcutils_uint8_array_fini(&mut serialized_message);
+            }
+            return Err(e);
+        }
+
+        // Copy the serialized bytes out into an owned Vec.
+        // SAFETY: On success, `buffer` points to `buffer_length` valid bytes.
+        let bytes = unsafe {
+            if serialized_message.buffer.is_null() || serialized_message.buffer_length == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(
+                    serialized_message.buffer,
+                    serialized_message.buffer_length,
+                )
+                .to_vec()
+            }
+        };
+
+        // SAFETY: `serialized_message` was successfully initialized above.
+        unsafe {
+            let _ = rcutils_uint8_array_fini(&mut serialized_message);
+        }
+
+        Ok((bytes, MessageInfo::from_rmw_message_info(&message_info)))
     }
 }
 
@@ -445,6 +537,80 @@ mod tests {
             assert_eq!(info.qos_profile.reliability, QoSReliabilityPolicy::Reliable);
             assert_eq!(info.qos_profile.durability, QoSDurabilityPolicy::Volatile);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_serialized_round_trip() -> Result<(), RclrsError> {
+        use crate::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+
+        let mut executor = Context::default().create_basic_executor();
+        let node = executor
+            .create_node(format!("test_serialized_round_trip_{}", line!()).as_str())
+            .unwrap();
+
+        let qos = QoSProfile::default().keep_all().reliable();
+
+        // First serialized subscription: captures the serialized bytes of a
+        // normally-published dynamic message.
+        let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let captured_cb = Arc::clone(&captured);
+        let _capture_sub = node.create_dynamic_serialized_subscription(
+            "test_msgs/msg/BasicTypes".try_into()?,
+            "serialized_capture_topic".qos(qos),
+            move |bytes: Vec<u8>, _info| {
+                *captured_cb.lock().unwrap() = Some(bytes);
+            },
+        )?;
+
+        let publisher = node.create_dynamic_publisher(
+            "test_msgs/msg/BasicTypes".try_into()?,
+            "serialized_capture_topic".qos(qos),
+        )?;
+
+        // Publish a default-valued dynamic message so the serialized subscriber
+        // records its on-the-wire bytes.
+        let metadata = DynamicMessageMetadata::new("test_msgs/msg/BasicTypes".try_into()?)?;
+        let message = metadata.create()?;
+        publisher.publish(message)?;
+
+        let start = std::time::Instant::now();
+        while captured.lock().unwrap().is_none() {
+            executor.spin(SpinOptions::spin_once());
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        }
+        let serialized_bytes = captured.lock().unwrap().take().unwrap();
+        assert!(!serialized_bytes.is_empty());
+
+        // Now feed those raw bytes back through publish_serialized and confirm a
+        // second serialized subscription receives an identical payload.
+        let received: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let got = Arc::new(AtomicBool::new(false));
+        let received_cb = Arc::clone(&received);
+        let got_cb = Arc::clone(&got);
+        let _echo_sub = node.create_dynamic_serialized_subscription(
+            "test_msgs/msg/BasicTypes".try_into()?,
+            "serialized_echo_topic".qos(qos),
+            move |bytes: Vec<u8>, _info| {
+                *received_cb.lock().unwrap() = Some(bytes);
+                got_cb.store(true, Ordering::Release);
+            },
+        )?;
+        let echo_publisher = node.create_dynamic_publisher(
+            "test_msgs/msg/BasicTypes".try_into()?,
+            "serialized_echo_topic".qos(qos),
+        )?;
+
+        echo_publisher.publish_serialized(&serialized_bytes)?;
+
+        let start = std::time::Instant::now();
+        while !got.load(Ordering::Acquire) {
+            executor.spin(SpinOptions::spin_once());
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        }
+        assert_eq!(received.lock().unwrap().take().unwrap(), serialized_bytes);
         Ok(())
     }
 }

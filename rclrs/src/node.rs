@@ -32,10 +32,10 @@ use rosidl_runtime_rs::{Action, Message};
 
 use crate::{
     dynamic_message::{
-        DynamicMessage, DynamicPublisher, DynamicPublisherState, DynamicSubscription,
-        DynamicSubscriptionState, GenericClient, GenericClientState, GenericService,
-        GenericServiceCallback, GenericServiceState, MessageTypeName,
-        NodeAsyncDynamicSubscriptionCallback, NodeDynamicSubscriptionCallback,
+        AnyGenericServiceCallback, AsyncGenericServiceCallback, DynamicMessage, DynamicPublisher,
+        DynamicPublisherState, DynamicSubscription, DynamicSubscriptionState, GenericClient,
+        GenericClientState, GenericService, GenericServiceCallback, GenericServiceState,
+        MessageTypeName, NodeAsyncDynamicSubscriptionCallback, NodeDynamicSubscriptionCallback,
         NodeSerializedSubscriptionCallback, ServiceTypeName,
     },
     rcl_bindings::*,
@@ -984,7 +984,30 @@ impl NodeState {
         GenericServiceState::create(
             service_type,
             options,
-            callback,
+            AnyGenericServiceCallback::Sync(callback),
+            &self.handle,
+            self.commands.async_worker_commands(),
+        )
+    }
+
+    /// Creates a [`GenericService`] with an async callback whose request/response types are only
+    /// known at runtime.
+    ///
+    /// The `service_type` is of the form `<package>/srv/<Type>`, e.g. `std_srvs/srv/SetBool`.
+    /// The callback receives the request [`crate::DynamicMessage`] and a freshly-created empty
+    /// response [`crate::DynamicMessage`], and returns a future resolving to the populated
+    /// response. The future runs on the executor's async task queue without blocking the executor
+    /// spin thread.
+    pub fn create_async_generic_service<'a>(
+        &self,
+        service_type: ServiceTypeName,
+        options: impl Into<ServiceOptions<'a>>,
+        callback: AsyncGenericServiceCallback,
+    ) -> Result<GenericService, RclrsError> {
+        GenericServiceState::create(
+            service_type,
+            options,
+            AnyGenericServiceCallback::Async(callback),
             &self.handle,
             self.commands.async_worker_commands(),
         )
@@ -1036,13 +1059,43 @@ impl NodeState {
                 }
             },
         );
-        GenericServiceState::create(
-            service_type,
-            options,
-            wrapper,
-            &self.handle,
-            self.commands.async_worker_commands(),
-        )
+        self.create_generic_service(service_type, options, wrapper)
+    }
+
+    /// Creates a [`GenericService`] with an async callback that operates on raw serialized (CDR)
+    /// request/response bytes.
+    ///
+    /// The callback receives the serialized request bytes and returns a future resolving to the
+    /// serialized response bytes. The future runs on the executor's async task queue without
+    /// blocking the executor spin thread, so other subscriptions, clients, and service requests
+    /// continue to be processed while the response is awaited.
+    pub fn create_async_generic_serialized_service<'a, F, Fut>(
+        &self,
+        service_type: ServiceTypeName,
+        options: impl Into<ServiceOptions<'a>>,
+        mut callback: F,
+    ) -> Result<GenericService, RclrsError>
+    where
+        F: FnMut(Vec<u8>) -> Fut + Send + 'static,
+        Fut: Future<Output = Vec<u8>> + Send + 'static,
+    {
+        let wrapper: AsyncGenericServiceCallback = Box::new(
+            move |request: DynamicMessage, response_proto: DynamicMessage| {
+                let request_bytes = match request.serialize() {
+                    Ok(bytes) => bytes,
+                    Err(_) => return Box::pin(async move { response_proto }),
+                };
+                let fut = callback(request_bytes);
+                Box::pin(async move {
+                    let response_bytes = fut.await;
+                    match response_proto.metadata().deserialize(&response_bytes) {
+                        Ok(response) => response,
+                        Err(_) => response_proto,
+                    }
+                })
+            },
+        );
+        self.create_async_generic_service(service_type, options, wrapper)
     }
 
     /// Creates a [`DynamicSubscription`] with an async callback.

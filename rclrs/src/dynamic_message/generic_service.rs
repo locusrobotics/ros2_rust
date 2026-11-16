@@ -5,15 +5,17 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+use futures::future::BoxFuture;
+
 use super::{
     get_service_type_support_handle, get_type_support_library, DynamicMessage,
     DynamicMessageMetadata, MessageTypeName, ServiceTypeName,
     INTROSPECTION_TYPE_SUPPORT_IDENTIFIER, REGULAR_TYPE_SUPPORT_IDENTIFIER,
 };
 use crate::{
-    rcl_bindings::*, NodeHandle, RclPrimitive, RclPrimitiveHandle, RclPrimitiveKind, RclReturnCode,
-    RclrsError, ReadyKind, ServiceOptions, ToResult, Waitable, WaitableLifecycle, WorkerCommands,
-    ENTITY_LIFECYCLE_MUTEX,
+    log_error, rcl_bindings::*, NodeHandle, RclPrimitive, RclPrimitiveHandle, RclPrimitiveKind,
+    RclReturnCode, RclrsError, ReadyKind, ServiceOptions, ToResult, Waitable, WaitableLifecycle,
+    WorkerCommands, ENTITY_LIFECYCLE_MUTEX,
 };
 
 /// The callback type for a [`GenericService`].
@@ -23,6 +25,19 @@ use crate::{
 /// thread, so it should not block for long periods.
 pub type GenericServiceCallback =
     Box<dyn FnMut(DynamicMessage, DynamicMessage) -> DynamicMessage + Send>;
+
+/// The async callback type for a [`GenericService`].
+///
+/// It receives the request message and a freshly-created (empty) response message, and must
+/// return a future resolving to the response message to send. The future runs on the
+/// executor's async task queue without blocking the executor spin thread.
+pub type AsyncGenericServiceCallback =
+    Box<dyn FnMut(DynamicMessage, DynamicMessage) -> BoxFuture<'static, DynamicMessage> + Send>;
+
+pub(crate) enum AnyGenericServiceCallback {
+    Sync(GenericServiceCallback),
+    Async(AsyncGenericServiceCallback),
+}
 
 /// A service server whose request/response types are only known at runtime.
 ///
@@ -35,7 +50,7 @@ pub type GenericService = Arc<GenericServiceState>;
 pub struct GenericServiceState {
     handle: Arc<GenericServiceHandle>,
     #[allow(unused)]
-    callback: Arc<Mutex<GenericServiceCallback>>,
+    callback: Arc<Mutex<AnyGenericServiceCallback>>,
     #[allow(unused)]
     lifecycle: WaitableLifecycle,
     #[allow(dead_code)]
@@ -57,7 +72,7 @@ impl GenericServiceState {
     pub(crate) fn create<'a>(
         service_type: ServiceTypeName,
         options: impl Into<ServiceOptions<'a>>,
-        callback: GenericServiceCallback,
+        callback: AnyGenericServiceCallback,
         node_handle: &Arc<NodeHandle>,
         commands: &Arc<WorkerCommands>,
     ) -> Result<Arc<Self>, RclrsError> {
@@ -162,6 +177,7 @@ impl GenericServiceState {
             Box::new(GenericServiceExecutable {
                 handle: Arc::clone(&handle),
                 callback: Arc::clone(&callback),
+                commands: Arc::clone(commands),
                 request_metadata: Arc::clone(&request_metadata),
                 response_metadata: Arc::clone(&response_metadata),
             }),
@@ -182,7 +198,8 @@ impl GenericServiceState {
 
 struct GenericServiceExecutable {
     handle: Arc<GenericServiceHandle>,
-    callback: Arc<Mutex<GenericServiceCallback>>,
+    callback: Arc<Mutex<AnyGenericServiceCallback>>,
+    commands: Arc<WorkerCommands>,
     request_metadata: Arc<DynamicMessageMetadata>,
     response_metadata: Arc<DynamicMessageMetadata>,
 }
@@ -216,15 +233,43 @@ impl RclPrimitive for GenericServiceExecutable {
         }
 
         let response_proto = self.response_metadata.create()?;
-        let mut response = (self.callback.lock().unwrap())(request, response_proto);
-        let response_ptr = response.storage.as_mut_ptr();
-        // SAFETY: The response was created from the matching response metadata.
-        rcl_send_response(
-            &*self.handle.lock(),
-            &mut request_id,
-            response_ptr as *mut _,
-        )
-        .ok()
+        let mut callback = self.callback.lock().unwrap();
+        match &mut *callback {
+            AnyGenericServiceCallback::Sync(cb) => {
+                let mut response = cb(request, response_proto);
+                drop(callback);
+                let response_ptr = response.storage.as_mut_ptr();
+                // SAFETY: The response was created from the matching response metadata.
+                rcl_send_response(
+                    &*self.handle.lock(),
+                    &mut request_id,
+                    response_ptr as *mut _,
+                )
+                .ok()
+            }
+            AnyGenericServiceCallback::Async(cb) => {
+                let response_fut = cb(request, response_proto);
+                drop(callback);
+                let handle = Arc::clone(&self.handle);
+                self.commands.run_async(async move {
+                    let mut response = response_fut.await;
+                    let response_ptr = response.storage.as_mut_ptr();
+                    // SAFETY: The response was created from the matching response metadata.
+                    let send_result = unsafe {
+                        rcl_send_response(&*handle.lock(), &mut request_id, response_ptr as *mut _)
+                    }
+                    .ok();
+                    if let Err(err) = send_result {
+                        let service_name = handle.service_name();
+                        log_error!(
+                            &service_name,
+                            "Error while sending service response for {request_id:?}: {err}",
+                        );
+                    }
+                });
+                Ok(())
+            }
+        }
     }
 
     fn kind(&self) -> RclPrimitiveKind {
@@ -342,6 +387,77 @@ mod tests {
         let request_bytes = request.serialize()?;
 
         // The blocking call must run off the executor spin thread.
+        let result: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let done = Arc::new(AtomicBool::new(false));
+        let result_thread = Arc::clone(&result);
+        let done_thread = Arc::clone(&done);
+        let client_thread = Arc::clone(&client);
+        let handle = std::thread::spawn(move || {
+            let response = client_thread
+                .call_serialized(&request_bytes, std::time::Duration::from_secs(10))
+                .unwrap();
+            *result_thread.lock().unwrap() = Some(response);
+            done_thread.store(true, Ordering::Release);
+        });
+
+        let start = std::time::Instant::now();
+        while !done.load(Ordering::Acquire) {
+            executor.spin(SpinOptions::spin_once());
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        }
+        handle.join().unwrap();
+
+        let response_bytes = result.lock().unwrap().take().unwrap();
+        let response = client.response_metadata().deserialize(&response_bytes)?;
+        assert_eq!(get_int64(&response, "sum"), 42);
+        Ok(())
+    }
+
+    #[test]
+    fn test_async_serialized_service_round_trip() -> Result<(), RclrsError> {
+        let mut executor = Context::default().create_basic_executor();
+        let node = executor
+            .create_node(format!("test_async_serialized_service_{}", line!()).as_str())
+            .unwrap();
+
+        let client = node.create_generic_client(
+            "example_interfaces/srv/AddTwoInts".try_into()?,
+            "async_serialized_add_two_ints",
+        )?;
+
+        let request_metadata = client.request_metadata().clone();
+        let response_metadata = client.response_metadata().clone();
+
+        let _service = node.create_async_generic_serialized_service(
+            "example_interfaces/srv/AddTwoInts".try_into()?,
+            "async_serialized_add_two_ints",
+            move |request_bytes: Vec<u8>| {
+                let request_metadata = request_metadata.clone();
+                let response_metadata = response_metadata.clone();
+                let (tx, rx) = futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let request = request_metadata.deserialize(&request_bytes).unwrap();
+                    let a = get_int64(&request, "a");
+                    let b = get_int64(&request, "b");
+                    let mut response = response_metadata.create().unwrap();
+                    set_int64(&mut response, "sum", a + b);
+                    let _ = tx.send(response.serialize().unwrap());
+                });
+                async move { rx.await.unwrap_or_default() }
+            },
+        )?;
+
+        let start = std::time::Instant::now();
+        while !client.service_is_ready()? {
+            executor.spin(SpinOptions::spin_once());
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        }
+
+        let mut request = client.request_metadata().create()?;
+        set_int64(&mut request, "a", 19);
+        set_int64(&mut request, "b", 23);
+        let request_bytes = request.serialize()?;
+
         let result: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
         let done = Arc::new(AtomicBool::new(false));
         let result_thread = Arc::clone(&result);

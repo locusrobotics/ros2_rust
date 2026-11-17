@@ -131,7 +131,11 @@ where
         node_handle: &Arc<NodeHandle>,
         commands: &Arc<WorkerCommands>,
     ) -> Result<Arc<Self>, RclrsError> {
-        let SubscriptionOptions { topic, qos } = options.into();
+        let SubscriptionOptions {
+            topic,
+            qos,
+            ignore_local_publications,
+        } = options.into();
         let callback = Arc::new(Mutex::new(callback));
 
         // SAFETY: Getting a zero-initialized value is always safe.
@@ -146,6 +150,9 @@ where
         // SAFETY: No preconditions for this function.
         let mut rcl_subscription_options = unsafe { rcl_subscription_get_default_options() };
         rcl_subscription_options.qos = qos.into();
+        rcl_subscription_options
+            .rmw_subscription_options
+            .ignore_local_publications = ignore_local_publications;
 
         {
             let rcl_node = node_handle.rcl_node.lock().unwrap();
@@ -244,6 +251,8 @@ pub struct SubscriptionOptions<'a> {
     pub topic: &'a str,
     /// The quality of service settings for the subscription.
     pub qos: QoSProfile,
+    /// Whether to ignore publications from publishers in the same context/participant.
+    pub ignore_local_publications: bool,
 }
 
 impl<'a> SubscriptionOptions<'a> {
@@ -252,7 +261,14 @@ impl<'a> SubscriptionOptions<'a> {
         Self {
             topic,
             qos: QoSProfile::topics_default(),
+            ignore_local_publications: false,
         }
+    }
+
+    /// Set whether to ignore publications from publishers in the same context/participant.
+    pub fn ignore_local_publications(mut self, ignore: bool) -> Self {
+        self.ignore_local_publications = ignore;
+        self
     }
 }
 
@@ -658,6 +674,7 @@ mod tests {
                 SubscriptionOptions {
                     topic: "test_subscription_qos_topic_3",
                     qos: expected_qos,
+                    ignore_local_publications: false,
                 },
                 |_: Empty| {
                     // Do nothing

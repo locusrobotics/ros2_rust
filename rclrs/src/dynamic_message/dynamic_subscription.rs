@@ -370,7 +370,11 @@ where
     ) -> Result<Arc<Self>, RclrsError> {
         // This loads the introspection type support library.
         let metadata = DynamicMessageMetadata::new(topic_type)?;
-        let SubscriptionOptions { topic, qos } = options.into();
+        let SubscriptionOptions {
+            topic,
+            qos,
+            ignore_local_publications,
+        } = options.into();
         // However, we also need the regular type support library –
         // the rosidl_typesupport_c one.
         let message_type = &metadata.message_type;
@@ -395,6 +399,9 @@ where
         // SAFETY: No preconditions for this function.
         let mut rcl_subscription_options = unsafe { rcl_subscription_get_default_options() };
         rcl_subscription_options.qos = qos.into();
+        rcl_subscription_options
+            .rmw_subscription_options
+            .ignore_local_publications = ignore_local_publications;
         // SAFETY: Getting a zero-initialized value is always safe.
         let mut rcl_subscription = unsafe { rcl_get_zero_initialized_subscription() };
         {

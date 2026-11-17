@@ -72,6 +72,31 @@ impl PublisherHandle {
         };
         Ok(subscription_count)
     }
+
+    /// Returns the RMW GID of this publisher.
+    pub(crate) fn gid(&self) -> Result<crate::PublisherGid, RclrsError> {
+        let rcl_publisher = self.rcl_publisher.lock().unwrap();
+        // SAFETY: rcl_publisher is valid while held by PublisherHandle.
+        let rmw_handle = unsafe { rcl_publisher_get_rmw_handle(&*rcl_publisher) };
+        if rmw_handle.is_null() {
+            return Err(RclrsError::RclError {
+                code: crate::RclReturnCode::PublisherInvalid,
+                msg: None,
+            });
+        }
+        let mut rmw_gid = rmw_gid_t {
+            implementation_identifier: std::ptr::null(),
+            data: [0; RMW_GID_STORAGE_SIZE],
+        };
+        // SAFETY: rmw_handle is non-null and valid while rcl_publisher is locked; rmw_gid is valid.
+        unsafe {
+            rmw_get_gid_for_publisher(rmw_handle, &mut rmw_gid).ok()?;
+        }
+        Ok(crate::PublisherGid {
+            data: rmw_gid.data,
+            implementation_identifier: rmw_gid.implementation_identifier,
+        })
+    }
 }
 
 /// Struct for sending messages of type `T`.
@@ -189,6 +214,11 @@ where
     /// Returns the number of subscriptions of the publisher.
     pub fn get_subscription_count(&self) -> Result<usize, RclrsError> {
         self.handle.get_subscription_count()
+    }
+
+    /// Returns the RMW GID of this publisher.
+    pub fn gid(&self) -> Result<crate::PublisherGid, RclrsError> {
+        self.handle.gid()
     }
 
     /// Get a promise that will be fulfilled when at least one subscriber is

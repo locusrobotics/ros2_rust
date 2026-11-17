@@ -114,6 +114,11 @@ impl DynamicPublisherState {
         self.handle.get_subscription_count()
     }
 
+    /// Returns the RMW GID of this publisher.
+    pub fn gid(&self) -> Result<crate::PublisherGid, RclrsError> {
+        self.handle.gid()
+    }
+
     /// Publishes a message.
     ///
     /// Calling `publish()` is a potentially blocking call, see [this issue][1] for details.
